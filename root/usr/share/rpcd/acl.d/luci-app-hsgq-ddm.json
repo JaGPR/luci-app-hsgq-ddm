@@ -1,0 +1,29 @@
+{
+	"luci-app-hsgq-ddm": {
+		"description": "Allow LuCI to read HSGQ GPON DDM diagnostics, OMCI managed entities, and test connection",
+		"read": {
+			"ubus": {
+				"hsgq_ddm": [
+					"get_status",
+					"get_info",
+					"get_history",
+					"test_connection",
+					"get_omci"
+				]
+			},
+			"uci": [
+				"hsgq_ddm"
+			]
+		},
+		"write": {
+			"ubus": {
+				"hsgq_ddm": [
+					"restart"
+				]
+			},
+			"uci": [
+				"hsgq_ddm"
+			]
+		}
+	}
+}

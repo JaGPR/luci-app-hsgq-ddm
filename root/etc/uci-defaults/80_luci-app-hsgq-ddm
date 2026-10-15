@@ -1,0 +1,44 @@
+#!/bin/sh
+# Runs once on install/upgrade, then removes itself.
+#
+# Modified from luci-app-vsol-ddm (Apache-2.0, AliLostInTheDark) for HSGQ /
+# ODI DFP-34X GPON SFP sticks. See NOTICE for the list of changes.
+#
+# Additive and idempotent: an option is only written when it is absent, so an
+# upgrade never clobbers a value the user already set.
+
+CFG=hsgq_ddm
+
+if ! uci -q get ${CFG}.main >/dev/null 2>&1; then
+	uci -q set ${CFG}.main=${CFG}
+fi
+
+set_default() {
+	# $1 = option, $2 = default value
+	if [ -z "$(uci -q get ${CFG}.main.$1)" ]; then
+		uci -q set ${CFG}.main.$1="$2"
+	fi
+}
+
+# host, username and password are never seeded: they identify and authenticate
+# against one specific stick, and a default credential would be written into
+# every router that installs this package.
+set_default enabled       1
+set_default port          23
+set_default poll_interval 3
+# A full HSGQ session (paced login + ~37 diag calls) takes about 9 s.
+set_default timeout       20
+set_default unit_system   metric
+set_default optical_class bplus
+
+uci -q commit ${CFG}
+
+# Flush LuCI and rpcd caches so the new view and ACL are picked up.
+rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache* /tmp/hsgq_ddm_cache.json
+
+if [ -f /etc/init.d/hsgq_ddm ]; then
+	/etc/init.d/hsgq_ddm enable >/dev/null 2>&1 || true
+	/etc/init.d/hsgq_ddm restart >/dev/null 2>&1 || true
+fi
+
+exit 0

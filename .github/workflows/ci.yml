@@ -1,0 +1,146 @@
+name: CI
+
+# Adapted from luci-app-vsol-ddm's CI (Apache-2.0). Every layer of this package
+# is a different language, so each is checked with the parser that will run it
+# on the router: BusyBox ash, BusyBox awk, and the browser's JS engine.
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shell:
+    name: Shell syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dash, busybox and shellcheck
+        run: sudo apt-get update && sudo apt-get install -y dash busybox shellcheck
+      - name: Parse with sh, dash and busybox ash
+        run: |
+          set -eu
+          for f in root/usr/libexec/rpcd/hsgq_ddm root/etc/init.d/hsgq_ddm \
+                   root/etc/uci-defaults/80_luci-app-hsgq-ddm install.sh uninstall.sh; do
+            sh -n "$f"; dash -n "$f"; busybox ash -n "$f"
+            echo "ok: $f"
+          done
+      # BusyBox sleep on OpenWrt rejects fractional seconds; a "sleep 0.5"
+      # silently becomes no delay at all and breaks the paced telnet login.
+      - name: No fractional sleeps
+        run: |
+          if grep -nE '^[^#]*\bsleep[ \t]+[0-9]*\.[0-9]' root/usr/libexec/rpcd/hsgq_ddm install.sh; then
+            echo "fractional sleep found: BusyBox on OpenWrt only accepts whole seconds" >&2; exit 1
+          fi
+          echo "ok: whole-second sleeps only"
+      - name: ShellCheck (advisory)
+        run: shellcheck -s sh -S warning root/usr/libexec/rpcd/hsgq_ddm install.sh uninstall.sh || true
+
+  awk:
+    name: Telemetry parser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mawk and busybox
+        run: sudo apt-get update && sudo apt-get install -y mawk busybox
+      - name: Empty transcript -> valid JSON with nulls (gawk, mawk, busybox awk)
+        run: |
+          set -eu
+          for a in "awk" "mawk" "busybox awk"; do
+            echo "" | $a -v host=h -v ts=1 -v req_class=bplus -f root/usr/share/hsgq_ddm/parse.awk > /tmp/empty.json
+            python3 - <<'EOF'
+          import json
+          d = json.load(open('/tmp/empty.json'))
+          for k in ('rx_power_dbm', 'tx_power_dbm', 'temperature_c', 'voltage_v'):
+              assert d['ddm'][k] is None, f"{k} must be null on an empty transcript"
+          EOF
+            echo "ok: $a"
+          done
+      - name: Real session fixture parses correctly (busybox awk)
+        run: |
+          set -eu
+          busybox awk -v host=192.0.2.1 -v ts=1 -v req_class=bplus \
+            -f root/usr/share/hsgq_ddm/parse.awk tests/fixtures/session.txt > /tmp/s.json
+          python3 - <<'EOF'
+          import json
+          d = json.load(open('/tmp/s.json'))
+          ddm, onu, dev = d['ddm'], d['onu'], d['device']
+          assert ddm['rx_power_dbm'] == -23.19, ddm['rx_power_dbm']
+          assert ddm['tx_power_dbm'] == 3.0
+          assert ddm['temperature_c'] == 48.12
+          assert ddm['voltage_v'] == 3.16
+          assert ddm['bias_current_ma'] == 14.05
+          assert onu['state'] == 'O5'
+          assert ddm['fec_uncorrectable_codewords'] == 0
+          assert onu['tcont_allocations'].startswith('336 (T-CONT 0)')
+          assert dev['vendor'] == 'HSGQ'
+          assert dev['uptime'] == '1d 3h 3m', dev['uptime']
+          assert dev['mac'] == '00:11:22:33:44:55'
+          assert dev['hardware'] == 'Linux 2.6.30.9'
+          assert dev['cpu_usage'].startswith('load 2.10')
+          assert dev['lan25g'].startswith('Up, 1000M Full')
+          assert dev['rx_bytes'] == 278694270 and dev['tx_bytes'] == 6449237
+          assert dev['rx_packets'] == 219558 + 28 + 419
+          assert dev['rx_dropped'] == 753
+          print("ok: every field parsed from the real session")
+          EOF
+      - name: OMCI parser emits valid JSON (busybox awk)
+        run: |
+          set -eu
+          printf 'XXXX\nOltG\nXXXX\n=====\nEntityId: 0x00\nOltVendorId: 0x414c434c\n=====\n' |
+            busybox awk -v host=h -v ts=1 -v classes=11,84,131,171,329 -f root/usr/share/hsgq_ddm/omci.awk |
+            python3 -m json.tool > /dev/null
+          echo "ok: omci.awk"
+
+  javascript:
+    name: LuCI views
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      # LuCI views are evaluated as function bodies with a top-level return.
+      - name: Parse every view
+        run: |
+          set -eu
+          for f in htdocs/luci-static/resources/view/hsgq_ddm/*.js; do
+            node -e "
+              const src = require('fs').readFileSync('$f', 'utf8');
+              new Function('return (function(){' + src + '})');
+              console.log('ok: $f');
+            "
+          done
+
+  data:
+    name: ACL and menu JSON
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate
+        run: |
+          set -eu
+          for f in root/usr/share/rpcd/acl.d/*.json root/usr/share/luci/menu.d/*.json; do
+            python3 -m json.tool "$f" > /dev/null && echo "ok: $f"
+          done
+
+  packaging:
+    name: Packaging sanity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Architecture-independent, referenced files present, no shipped credentials
+        run: |
+          set -eu
+          grep -qE '^\s*PKGARCH\s*:=\s*all' Makefile
+          for f in root/lib/upgrade/keep.d/luci-app-hsgq-ddm root/usr/share/hsgq_ddm/parse.awk \
+                   root/usr/share/hsgq_ddm/omci.awk root/etc/config/hsgq_ddm \
+                   root/etc/uci-defaults/80_luci-app-hsgq-ddm LICENSE NOTICE; do
+            test -f "$f" || { echo "missing: $f"; exit 1; }
+          done
+          # The shipped config must not carry an address or a credential.
+          for o in host username password; do
+            grep -qE "option $o ''" root/etc/config/hsgq_ddm || { echo "default $o must be empty"; exit 1; }
+          done
+          echo "ok: packaging"

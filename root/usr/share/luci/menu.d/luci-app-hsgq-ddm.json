@@ -1,0 +1,28 @@
+{
+	"admin/status/hsgq_ddm": {
+		"title": "HSGQ GPON DDM",
+		"order": 57,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-hsgq-ddm" ]
+		}
+	},
+	"admin/status/hsgq_ddm/dashboard": {
+		"title": "Optical Diagnostics",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "hsgq_ddm/dashboard"
+		}
+	},
+	"admin/status/hsgq_ddm/settings": {
+		"title": "Settings",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "hsgq_ddm/settings"
+		}
+	}
+}

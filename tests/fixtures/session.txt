@@ -1,0 +1,67 @@
+login: user
+Password:
+# echo "SYSUPTIME_S: $(cut -d. -f1 /proc/uptime)"
+SYSUPTIME_S: 97384
+# echo "FWVER: $(cat /proc/version)"
+FWVER: Linux version 2.6.30.9 (root@ubuntu) (gcc version 4.4.6 (Realtek RSDK-1.5.6p2) ) #141 Mon Apr 8 14:48:43 CST 2024 [V1.0-]
+# echo "MAC Address: $(cat /sys/class/net/eth0/address 2>/dev/null)"
+MAC Address: 00:11:22:33:44:55
+# diag pon get transceiver rx-power
+pon get transceiver rx-power
+Rx Power: -23.187588  dBm
+RTK.0> command:# diag pon get transceiver tx-power
+pon get transceiver tx-power
+Tx Power: 2.995293  dBm
+RTK.0> command:# diag pon get transceiver temperature
+pon get transceiver temperature
+Temperature: 48.121094 C
+RTK.0> command:# diag pon get transceiver voltage
+pon get transceiver voltage
+Voltage: 3.162500 V
+RTK.0> command:# diag pon get transceiver bias-current
+pon get transceiver bias-current
+Bias Current: 14.050000 mA
+RTK.0> command:# diag gpon get onu-state
+gpon get onu-state
+ONU state: Operation State(O5)
+RTK.0> command:# diag gpon show counter global ds-phy
+gpon show counter global ds-phy
+============================================================
+     GPON ONU MAC Device Counter: DS PHY
+BIP Error bits  : 0
+BIP Error blocks: 0
+FEC Correct bits: 0
+FEC Correct bytes: 0
+FEC Correct codewords: 0
+FEC codewords Uncor: 0
+Superframe LOS  : 0
+PLEN fail       : 0
+PLEN correct    : 0
+============================================================
+RTK.0> command:# exit
+# diag gpon get tcont alloc-id 336
+gpon get tcont alloc-id 336
+alloc_id: 336, TCONT_id 0:
+RTK.0> command:# diag port get status port all
+port get status port all
+Port Status Speed    Duplex TX_FC RX_FC
+---- ------ -----    ------ ----- -----
+0    Up     1000M    Full   Dis   Dis
+2    Up     1000M    Full   Dis   Dis
+RTK.0> command:# diag mib dump counter port 0
+mib dump counter port 0
+Port: 0
+ifInOctets                         :                 278694270
+ifInUcastPkts                      :                    219558
+ifInMulticastPkts                  :                        28
+ifInBroadcastPkts                  :                       419
+ifOutOctets                        :                   6449237
+ifOutDiscards                      :                         0
+ifOutUcastPkts                     :                     72163
+ifOutMulticastPkts                 :                        12
+ifOutBroadcastPkts                 :                         0
+dot1dTpPortInDiscards              :                       753
+dot3StatsSymbolErrors              :                         0
+etherStatsCRCAlignErrors           :                         0
+RTK.0> command:# echo "LOADAVG: $(cat /proc/loadavg)"
+LOADAVG: 2.10 2.08 2.01 2/39 310

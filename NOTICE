@@ -1,0 +1,49 @@
+luci-app-hsgq-ddm
+Optical diagnostics for HSGQ / ODI DFP-34X GPON SFP sticks on OpenWrt.
+
+This product is a modified version of luci-app-vsol-ddm
+  https://github.com/AliLostInTheDark/luci-app-vsol-ddm
+  Copyright the luci-app-vsol-ddm authors.
+  Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+All credit for the dashboard design, the rpcd backend architecture (session
+lock, cache, bounded staleness, history), the Realtek diag/OMCI parsers and the
+LuCI views belongs to the original authors. This fork adapts that work to a
+different device; it is not affiliated with or endorsed by them, by HSGQ, or by ODI.
+
+Changes made in this fork (Apache-2.0 section 4(b)):
+
+  Naming
+  - Package, UCI config, ubus object, cache/history/lock files, LuCI menu and
+    ACL renamed vsol_ddm -> hsgq_ddm so both tools can be installed side by side.
+
+  Backend (root/usr/libexec/rpcd/hsgq_ddm)
+  - Login flow rewritten for the stick's Linux telnetd + login(1): username and
+    password are paced instead of pipelined, then each Realtek diag command runs
+    one-shot ("diag <cmd>") from the "#" shell instead of inside a vendor CLI.
+  - Device facts (uptime, load average, kernel/firmware, MAC) read from Linux
+    (/proc/uptime via the shell's read builtin, /proc/loadavg, /proc/version,
+    /sys/class/net/eth0/address) because the stick has no "show version".
+  - T-CONT queries extended to alloc-IDs 336-339 in addition to 256-259.
+  - SFP host-port traffic counters read from "diag mib dump counter port 0".
+  - OMCI read directly in the "#" shell (no vendor "AP#" prompt).
+  - Restart uses Linux "reboot".
+  - Whole-second sleeps only: BusyBox sleep on OpenWrt rejects fractions.
+  - Timeout default 20 s (a full session takes ~9 s), cache TTL 10 s,
+    max stale 45 s, lock wait 20 s.
+
+  Parser (root/usr/share/hsgq_ddm/parse.awk)
+  - Added: uptime, load average, firmware/kernel, SFP MIB counters.
+  - Model taken from the optic's vendor + part number (e.g. "ODI DFP-34X-2C2").
+  - Device vendor reported as HSGQ.
+
+  LuCI views (htdocs/luci-static/resources/view/hsgq_ddm)
+  - Ethernet card replaced by "SFP Host Interface & Traffic" (an SFP ONU has
+    no RJ45 ports; removed LAN 1G and management-link rows).
+  - System card labels adapted (Kernel, CPU load averages).
+  - Settings: timeout range 15-30 s, default 20 s; texts adapted.
+  - Removed purge of the original's localStorage keys.
+
+  Packaging
+  - New install.sh / uninstall.sh for installing without the OpenWrt SDK.
+  - New uci-defaults and CI workflow adapted from the original.

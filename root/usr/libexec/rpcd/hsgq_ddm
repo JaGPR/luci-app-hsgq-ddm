@@ -1,0 +1,573 @@
+#!/bin/sh
+# Modified from luci-app-vsol-ddm (Apache-2.0, https://github.com/AliLostInTheDark/luci-app-vsol-ddm)
+# for HSGQ / ODI DFP-34X GPON SFP sticks. See NOTICE for the list of changes.
+# HSGQ GPON stick / Realtek ONU DDM & Optical Diagnostics rpcd backend
+#
+# Concurrency note: the ONT's telnet server accepts only a very small number of
+# simultaneous sessions -- measured at two on a HSGQ stick, with the third connect
+# attempt timing out. Two LuCI browser tabs polling at the configured interval
+# are therefore enough to starve any other caller, which surfaced as a spurious
+# "timed out or unreachable" even though the ONT was perfectly healthy.
+#
+# Every device query is consequently serialised behind a lock, and the cache is
+# re-checked once the lock is held: concurrent callers collapse onto a single
+# telnet session and then all read the same fresh result.
+
+UCI_CONFIG="hsgq_ddm"
+CACHE_FILE="/tmp/hsgq_ddm_cache.json"
+LOCK_FILE="/tmp/hsgq_ddm.lock"
+
+# Serving the dashboard from cache for the length of one poll interval keeps a
+# single viewer to one telnet session per poll instead of one per request.
+# HSGQ: one query is a paced login plus ~30 one-shot diag calls (several
+# seconds), so cache for longer than the VSOL's 2 s to avoid back-to-back sessions.
+CACHE_TTL=10
+
+# Instant-load window.
+#
+# Opening the LuCI page should paint immediately rather than waiting out a telnet
+# round trip, so a cache entry older than CACHE_TTL is still served at once and a
+# refresh is kicked off in the background for the next poll.
+#
+# That trade is only safe while it stays bounded. Serving arbitrarily old data
+# would mean an ONT that died ten minutes ago still renders as a healthy link --
+# the same "failure disguised as data" this backend exists to avoid. Past
+# MAX_STALE the shortcut is abandoned and the caller waits for a real answer, so
+# a genuinely dead device surfaces as an error rather than as stale telemetry.
+MAX_STALE=45
+
+# Upper bound on how long a caller waits for an in-flight query, where the flock
+# implementation supports a timeout at all. Comfortably above the query time.
+LOCK_WAIT=20
+
+# BusyBox flock accepts only -s -x -u -n: there is no -w timeout option, and
+# passing one makes it exit with a usage error rather than taking the lock.
+# util-linux flock does support -w. Detect once, and fall back to a plain
+# blocking exclusive lock, which is safe here because every query is bounded by
+# the helper's own connect/read timeouts.
+if command -v flock >/dev/null 2>&1; then
+	HAVE_FLOCK=1
+	if flock -w 1 -u 0 2>/dev/null; then FLOCK_W=1; else FLOCK_W=0; fi
+else
+	HAVE_FLOCK=0
+	FLOCK_W=0
+fi
+
+# Acquire the exclusive lock on fd 9. Returns non-zero only if the lock could not
+# be taken; callers must then still perform the query rather than reporting a
+# device error, because failing to lock says nothing about the device.
+take_lock() {
+	if [ "$FLOCK_W" = "1" ]; then
+		flock -w "$LOCK_WAIT" 9
+	else
+		flock -x 9
+	fi
+}
+
+umask 077
+
+# The address and credentials have no defaults on purpose. They identify and
+# authenticate against one specific ONT, so a built-in value is either wrong for
+# the user's hardware or - worse - a real credential shipped to every router.
+# Only settings that are safe to assume carry defaults here.
+get_config() {
+	ENABLED="1"
+	HOST=""
+	PORT="23"
+	USER=""
+	PASS=""
+	# Paced login (4 s) + ~37 one-shot diag calls: a full session measured 9 s.
+	TIMEOUT="20"
+	OPTICAL_CLASS="bplus"
+
+	if command -v uci >/dev/null 2>&1; then
+		v=$(uci -q get ${UCI_CONFIG}.main.enabled);       [ -n "$v" ] && ENABLED="$v"
+		v=$(uci -q get ${UCI_CONFIG}.main.host);          [ -n "$v" ] && HOST="$v"
+		v=$(uci -q get ${UCI_CONFIG}.main.port);          [ -n "$v" ] && PORT="$v"
+		v=$(uci -q get ${UCI_CONFIG}.main.username);      [ -n "$v" ] && USER="$v"
+		v=$(uci -q get ${UCI_CONFIG}.main.password);      [ -n "$v" ] && PASS="$v"
+		v=$(uci -q get ${UCI_CONFIG}.main.timeout);       [ -n "$v" ] && TIMEOUT="$v"
+		v=$(uci -q get ${UCI_CONFIG}.main.optical_class); [ -n "$v" ] && OPTICAL_CLASS="$v"
+	fi
+
+	case "$OPTICAL_CLASS" in
+		bplus|cplus|epon_px20) ;;
+		*) OPTICAL_CLASS="bplus" ;;
+	esac
+	case "$TIMEOUT" in
+		''|*[!0-9]*) TIMEOUT=20 ;;
+	esac
+	# At least 15 s (a full session measured 9 s), at most 30 s.
+	[ "$TIMEOUT" -lt 15 ] && TIMEOUT=15
+	[ "$TIMEOUT" -gt 30 ] && TIMEOUT=30
+}
+
+# True once the user has supplied everything needed to reach their ONT.
+#
+# All three are required. With no address there is nothing to connect to; with
+# no credentials the session cannot authenticate and the CLI would sit at a
+# login prompt until the timeout. Probing a guessed address is worse than doing
+# nothing: on someone else's network that address belongs to another device.
+is_configured() {
+	[ -n "$HOST" ] && [ -n "$USER" ] && [ -n "$PASS" ]
+}
+
+# Envelope for "the user has not pointed this at an ONT yet".
+#
+# Distinct from a failure: `configured` is false rather than `success` merely
+# being false, so the dashboard can render empty cards instead of an error
+# banner. Nothing has gone wrong - there is simply nothing to read.
+unconfigured_json() {
+	printf '{"success": false, "configured": false, "connected": false, "host": "", "error": "Not configured. Set the ONT address, username and password under Settings."}\n'
+}
+
+HISTORY_FILE="/tmp/hsgq_ddm_history.json"
+MAX_HISTORY_ENTRIES=1440
+
+record_history_sample() {
+	[ -n "$1" ] || return 0
+	_now=$(date +%s)
+	if [ -f "$HISTORY_FILE" ]; then
+		_last_ts=$(tail -n 1 "$HISTORY_FILE" 2>/dev/null | sed -n 's/.*\[\([0-9]*\),.*/\1/p')
+		if [ -n "$_last_ts" ] && [ $(( _now - _last_ts )) -lt 55 ]; then
+			return 0
+		fi
+	fi
+
+	printf '%s\n' "$1" | awk -v now="$_now" -v hist="$HISTORY_FILE" '
+	BEGIN { rx="null"; tx="null"; temp="null"; bias="null"; ok=0 }
+	/"success"[ \t]*:[ \t]*true/ { ok=1 }
+	/"rx_power_dbm"[ \t]*:[ \t]*-?[0-9.]+/ {
+		if (match($0, /"rx_power_dbm"[ \t]*:[ \t]*-?[0-9.]+/)) {
+			s = substr($0, RSTART, RLENGTH); sub(/.*:[ \t]*/, "", s); rx = s
+		}
+	}
+	/"tx_power_dbm"[ \t]*:[ \t]*-?[0-9.]+/ {
+		if (match($0, /"tx_power_dbm"[ \t]*:[ \t]*-?[0-9.]+/)) {
+			s = substr($0, RSTART, RLENGTH); sub(/.*:[ \t]*/, "", s); tx = s
+		}
+	}
+	/"temperature_c"[ \t]*:[ \t]*-?[0-9.]+/ {
+		if (match($0, /"temperature_c"[ \t]*:[ \t]*-?[0-9.]+/)) {
+			s = substr($0, RSTART, RLENGTH); sub(/.*:[ \t]*/, "", s); temp = s
+		}
+	}
+	/"bias_current_ma"[ \t]*:[ \t]*-?[0-9.]+/ {
+		if (match($0, /"bias_current_ma"[ \t]*:[ \t]*-?[0-9.]+/)) {
+			s = substr($0, RSTART, RLENGTH); sub(/.*:[ \t]*/, "", s); bias = s
+		}
+	}
+	END {
+		if (ok) {
+			print "[" now "," rx "," tx "," temp "," bias "]" >> hist
+		}
+	}'
+
+	_lines=$(wc -l < "$HISTORY_FILE" 2>/dev/null || echo 0)
+	if [ "$_lines" -gt "$MAX_HISTORY_ENTRIES" ]; then
+		_trim=$(( _lines - MAX_HISTORY_ENTRIES ))
+		sed -i "1,${_trim}d" "$HISTORY_FILE" 2>/dev/null
+	fi
+}
+
+get_history() {
+	printf '{"success": true, "timestamp": %s, "history": [' "$(date +%s)"
+	if [ -f "$HISTORY_FILE" ]; then
+		awk 'NR>1{printf ","} {printf "%s", $0}' "$HISTORY_FILE"
+	fi
+	printf ']}\n'
+}
+
+run_daemon() {
+	while true; do
+		fetch_telemetry >/dev/null 2>&1
+		sleep 60
+	done
+}
+
+# Age check against the cache file's modification time.
+cache_fresh() {
+	# cache_fresh <maximum age in seconds>
+	[ -f "$CACHE_FILE" ] || return 1
+	_now=$(date +%s)
+	_mt=$(date -r "$CACHE_FILE" +%s 2>/dev/null) || return 1
+	[ -n "$_mt" ] || return 1
+	[ $((_now - _mt)) -le "$1" ]
+}
+
+# Write a successful result to the cache atomically, so a concurrent reader can
+# never observe a half-written file.
+store_result() {
+	# store_result <json>
+	case "$1" in
+		*'"success": true'*)
+			printf '%s' "$1" > "${CACHE_FILE}.$$" 2>/dev/null &&
+				mv "${CACHE_FILE}.$$" "$CACHE_FILE" 2>/dev/null
+			rm -f "${CACHE_FILE}.$$" 2>/dev/null
+			record_history_sample "$1"
+			return 0
+			;;
+	esac
+	return 1
+}
+
+# Refresh the cache without the caller waiting for it.
+#
+# Detached from rpcd's stdout: leaving the inherited descriptor open would make
+# ubus wait for this child before returning the response, which is exactly the
+# delay the background refresh exists to remove. The non-blocking lock means a
+# refresh already in flight is left to finish rather than starting a second
+# telnet session alongside it.
+refresh_async() {
+	(
+		exec >/dev/null 2>&1 </dev/null
+		if [ "$HAVE_FLOCK" = "1" ]; then
+			exec 9>"$LOCK_FILE"
+			flock -n 9 || exit 0
+		fi
+		store_result "$(do_query)"
+	) &
+}
+
+PARSER="/usr/share/hsgq_ddm/parse.awk"
+
+# Seconds to hold the command pipe open after the last command. Each one-shot
+# diag call starts the Realtek diag binary afresh, so ~30 of them need a few
+# seconds to finish replying before nc may close the socket.
+READ_HOLD="4"
+
+# Run one telnet session against the ONT and emit the dashboard JSON.
+#
+# The ONT speaks plain telnet with no negotiation of consequence, so BusyBox nc
+# is sufficient and the package needs no compiled helper: it installs on any
+# architecture. Commands are pipelined into a single session exactly as the
+# previous C client did, which is what keeps this to one connection and about a
+# third of a second rather than a round trip per command.
+#
+# The writer runs in the background feeding a FIFO so that nc keeps the socket
+# open while the ONT replies; a plain pipe would close stdin and the ONT would
+# hang up before answering. `timeout` bounds the whole exchange, standing in for
+# the non-blocking connect the C version performed.
+do_query() {
+	[ -f "$PARSER" ] || return 1
+
+	# A plain pipe, deliberately not a FIFO. Opening a FIFO for reading blocks
+	# until a writer opens it, so nc and the command writer can race on the open
+	# and deadlock; the trailing sleep simply holds the pipe open long enough for
+	# the ONT to finish replying before nc sees EOF and closes the socket.
+	#
+	# Commands are pipelined into one session exactly as the previous C client
+	# did, which is what keeps this to a single connection. That matters: the ONT
+	# accepts only about two concurrent telnet sessions.
+	#
+	# Telnet IAC bytes and CR are stripped by tr rather than in awk, because
+	# BusyBox awk rejects octal ranges inside bracket expressions and one parser
+	# has to run under gawk, mawk and BusyBox awk alike.
+	# HSGQ differs from the VSOL here: it is a plain Linux telnetd + login, not a
+	# vendor CLI. login(1) can discard type-ahead while it switches the tty for
+	# the password, so the username and password are paced rather than
+	# pipelined. After that the stick drops to a "#" shell, where each Realtek
+	# diag command is run one-shot ("diag <cmd>") -- the form verified on this
+	# unit -- and prints its value followed by an "RTK.0> command:" prompt.
+	#
+	# Device facts the VSOL reads from its vendor CLI (uptime, firmware, MAC)
+	# come from Linux here. They are echoed behind fixed labels so the parser
+	# never has to guess which bare number is which. The single quotes keep
+	# $(...) literal so it is expanded on the stick, not on the router.
+	# BusyBox sleep on the router only takes whole seconds ("sleep 0.5" fails
+	# instantly), so the pacing uses integers. The stick has no cut(1); the
+	# shell's own `read` splits /proc/uptime instead.
+	_raw=$( {
+		sleep 1
+		printf '%s\r\n' "$USER"
+		sleep 1
+		printf '%s\r\n' "$PASS"
+		sleep 2
+		printf '%s\r\n' 'read u _ < /proc/uptime; echo "SYSUPTIME_S: ${u%%.*}"'
+		printf '%s\r\n' 'echo "LOADAVG: $(cat /proc/loadavg)"'
+		printf '%s\r\n' 'echo "FWVER: $(cat /proc/version)"'
+		printf '%s\r\n' 'echo "MAC Address: $(cat /sys/class/net/eth0/address 2>/dev/null)"'
+		for _c in \
+			'pon get transceiver rx-power' 'pon get transceiver tx-power' \
+			'pon get transceiver temperature' 'pon get transceiver voltage' \
+			'pon get transceiver bias-current' 'pon get transceiver vendor-name' \
+			'pon get transceiver part-number' \
+			'gpon get onu-state' 'gpon get serial-number' 'gpon get alarm-status' \
+			'gpon get ds-phy' 'gpon get eqd-offset' \
+			'gpon get us-ploam' 'gpon get rdi' 'gpon get ds-omci' 'gpon get password' \
+			'gpon get ds-gem' \
+			'gpon get tcont alloc-id 256' 'gpon get tcont alloc-id 257' \
+			'gpon get tcont alloc-id 258' 'gpon get tcont alloc-id 259' \
+			'gpon get tcont alloc-id 336' 'gpon get tcont alloc-id 337' \
+			'gpon get tcont alloc-id 338' 'gpon get tcont alloc-id 339' \
+			'gpon get us-flow flow-id 0' 'gpon get us-flow flow-id 1' \
+			'gpon get us-flow flow-id 2' 'gpon get us-flow flow-id 3' \
+			'gpon show counter global ds-phy' 'port get status port all' \
+			'mib dump counter port 0'; do
+			printf 'diag %s\r\n' "$_c"
+		done
+		printf 'exit\r\n'
+		sleep "$READ_HOLD"
+	} | timeout "$TIMEOUT" nc "$HOST" "$PORT" 2>/dev/null |
+	    tr -d '\377\376\375\374\373\372\371\r' )
+
+	# A session that never reached the CLI prompt read nothing worth parsing.
+	case "$_raw" in
+		*"RTK.0>"*) ;;
+		*) return 1 ;;
+	esac
+
+	printf '%s\n' "$_raw" | awk \
+		-v host="$HOST" -v ts="$(date +%s)" -v req_class="$OPTICAL_CLASS" \
+		-f "$PARSER"
+}
+
+fetch_telemetry() {
+	get_config
+
+	is_configured || { unconfigured_json; return; }
+
+	if [ "$ENABLED" != "1" ]; then
+		printf '{"success": false, "connected": false, "host": "%s", "error": "Monitoring has been disabled in configuration"}\n' "$HOST"
+		return
+	fi
+
+	# Fast path: fresh cache, no lock needed.
+	if cache_fresh "$CACHE_TTL"; then
+		cat "$CACHE_FILE"
+		return
+	fi
+
+	if [ ! -f "$PARSER" ]; then
+		printf '{"success": false, "connected": false, "host": "%s", "error": "parser %s is missing from the installation"}\n' "$HOST" "$PARSER"
+		return
+	fi
+
+	# Instant load: within the bounded staleness window, answer from cache right
+	# away and refresh behind the response. The page paints on the cached values
+	# and the next poll picks up the fresh ones.
+	if cache_fresh "$MAX_STALE"; then
+		cat "$CACHE_FILE"
+		refresh_async
+		return
+	fi
+
+	RES=""
+	GOT_LOCK=0
+	if [ "$HAVE_FLOCK" = "1" ]; then
+		# Serialise device access. Under the lock, re-check the cache: if another
+		# caller refreshed it while we waited, reuse that instead of opening a
+		# second telnet session for the same data.
+		exec 9>"$LOCK_FILE"
+		if take_lock; then
+			GOT_LOCK=1
+			if cache_fresh "$CACHE_TTL"; then
+				cat "$CACHE_FILE"
+				flock -u 9 2>/dev/null
+				exec 9>&-
+				return
+			fi
+			RES=$(do_query)
+			flock -u 9 2>/dev/null
+		fi
+		exec 9>&-
+	fi
+
+	# No lock support, or the lock could not be taken. Query anyway: an unavailable
+	# lock is a statement about this script, not about the ONT, and reporting it as
+	# a device failure would be a lie.
+	if [ "$GOT_LOCK" != "1" ] && [ -z "$RES" ]; then
+		RES=$(do_query)
+	fi
+
+	if [ -n "$RES" ] && store_result "$RES"; then
+		echo "$RES"
+		return
+	fi
+
+	# The query failed and control only reaches here when the cache was already
+	# older than MAX_STALE -- anything newer was served by the instant-load path
+	# above, which is what absorbs an isolated dropped poll. Replaying a cache
+	# that old would render a link that has been down for minutes as healthy, so
+	# the failure is reported instead. The dashboard shows an error banner rather
+	# than telemetry that is no longer true.
+	if [ -n "$RES" ]; then
+		# The helper produced its own structured error; pass it through verbatim.
+		echo "$RES"
+	else
+		printf '{"success": false, "connected": false, "host": "%s", "error": "Unable to connect or authenticate to HSGQ ONT at %s:%s"}\n' \
+			"$HOST" "$HOST" "$PORT"
+	fi
+}
+
+test_connection() {
+	get_config
+
+	is_configured || { unconfigured_json; return; }
+
+	# Takes the same lock: a connectivity test must not itself become the session
+	# that tips the ONT over its concurrent-session limit.
+	if [ "$HAVE_FLOCK" = "1" ]; then
+		exec 9>"$LOCK_FILE"
+		take_lock
+	fi
+
+	_out=$(do_query)
+	_rc=$?
+
+	if [ "$HAVE_FLOCK" = "1" ]; then
+		flock -u 9 2>/dev/null
+		exec 9>&-
+	fi
+
+	if [ "$_rc" -eq 0 ] && [ -n "$_out" ]; then
+		printf '{"success": true, "connected": true, "host": "%s", "message": "Connected and authenticated over telnet"}\n' "$HOST"
+	else
+		printf '{"success": false, "connected": false, "host": "%s", "error": "Unable to connect or authenticate to the ONT at %s:%s"}\n' \
+			"$HOST" "$HOST" "$PORT"
+	fi
+}
+
+# Managed entities rendered by the dashboard, in card order.
+#   11  EthUni                 physical Ethernet UNI ports
+#   84  VlanTagFilterData      the VLANs the ONT accepts
+#  131  OltG                   OLT vendor identification
+#  171  ExtVlanTagOperCfgData  VLAN tagging/translation rules
+#  329  VEIP                   virtual Ethernet interface point
+OMCI_CLASSES="11,84,131,171,329"
+OMCI_PARSER="/usr/share/hsgq_ddm/omci.awk"
+OMCI_CACHE="/tmp/hsgq_ddm_omci.json"
+
+# Per-command settle time. ME 171 alone emits a few hundred lines and the ONT
+# echoes them slowly, so commands are paced rather than pipelined blind; the
+# whole exchange is still bounded by OMCI_TIMEOUT below.
+OMCI_STEP=3
+OMCI_TIMEOUT=25
+
+# OMCI state is configuration, not telemetry: it changes when the OLT reprovisions
+# the ONT, not between polls. Caching it for a minute keeps this off the 3-second
+# telemetry path, which matters because the ONT accepts only about two concurrent
+# telnet sessions and this query holds one for the better part of 20 seconds.
+OMCI_CACHE_TTL=60
+
+# Read the OMCI managed entities. omcicli is an ordinary command in the stick's
+# "#" shell, so it runs directly after login rather than through diag.
+fetch_omci() {
+	get_config
+
+	is_configured || { unconfigured_json; return; }
+
+	if [ "$ENABLED" != "1" ]; then
+		printf '{"success": false, "connected": false, "host": "%s", "error": "Monitoring has been disabled in configuration"}\n' "$HOST"
+		return
+	fi
+
+	if [ ! -f "$OMCI_PARSER" ]; then
+		printf '{"success": false, "connected": false, "host": "%s", "error": "parser %s is missing from the installation"}\n' \
+			"$HOST" "$OMCI_PARSER"
+		return
+	fi
+
+	# Serve from cache if fresh (within 24 hours unless explicitly cleared on LOS)
+	if [ -f "$OMCI_CACHE" ] && [ -n "$(find "$OMCI_CACHE" -mmin -1440 2>/dev/null)" ]; then
+		cat "$OMCI_CACHE"
+		return
+	fi
+
+	# Same paced Linux login as do_query; omcicli is a normal command in the "#"
+	# shell on the HSGQ (verified: "omcicli mib get 131" prints the OltG entity).
+	_raw=$( {
+		sleep 1
+		printf '%s\r\n' "$USER"
+		sleep 1
+		printf '%s\r\n' "$PASS"
+		sleep 2
+		printf 'omcicli mib get 11\r\nomcicli mib get 84\r\nomcicli mib get 131\r\nomcicli mib get 171\r\nomcicli mib get 329\r\nexit\r\n'
+		sleep 6
+	} | timeout "$OMCI_TIMEOUT" nc "$HOST" "$PORT" 2>/dev/null |
+	    tr -d '\377\376\375\374\373\372\371\r' )
+
+	# An OMCI entity dump only appears after a successful login.
+	case "$_raw" in
+		*"EntityId"*) ;;
+		*)
+			printf '{"success": false, "connected": false, "host": "%s", "error": "Unable to reach the ONT CLI at %s:%s"}\n' \
+				"$HOST" "$HOST" "$PORT"
+			return
+			;;
+	esac
+
+	_out=$(printf '%s\n' "$_raw" | awk \
+		-v host="$HOST" -v ts="$(date +%s)" -v classes="$OMCI_CLASSES" \
+		-f "$OMCI_PARSER")
+
+	case "$_out" in
+		*'"me":{"'*)
+			printf '%s\n' "$_out" > "$OMCI_CACHE" 2>/dev/null
+			printf '%s\n' "$_out"
+			;;
+		*)
+			printf '{"success": false, "connected": true, "host": "%s", "error": "The ONT replied but no managed entities could be parsed"}\n' "$HOST"
+			;;
+	esac
+}
+
+# Reboot the stick (Linux `reboot` in its shell).
+#
+# The ONT drops the session as it goes down, so a read timeout here is the
+# expected outcome rather than a failure, and the stale OMCI cache is dropped
+# so the dashboard repopulates from the rebooted ONT.
+do_restart() {
+	get_config
+
+	is_configured || { unconfigured_json; return; }
+
+	# HSGQ: Linux shell, so a plain reboot.
+	{
+		sleep 1
+		printf '%s\r\n' "$USER"
+		sleep 1
+		printf '%s\r\n' "$PASS"
+		sleep 2
+		printf 'reboot\r\n'
+		sleep 1
+	} | timeout "$TIMEOUT" nc "$HOST" "$PORT" >/dev/null 2>&1
+
+	rm -f "$OMCI_CACHE" "$CACHE_FILE" 2>/dev/null
+
+	printf '{"success": true, "host": "%s", "message": "Restart command sent to the ONT. It will be unreachable for about a minute."}\n' "$HOST"
+}
+
+case "$1" in
+	list)
+		echo '{ "get_status": {}, "get_info": {}, "get_history": {}, "test_connection": {}, "get_omci": {}, "restart": {} }'
+		;;
+	call)
+		case "$2" in
+			get_status|get_info)
+				fetch_telemetry
+				;;
+			get_history)
+				get_history
+				;;
+			get_omci)
+				fetch_omci
+				;;
+			restart)
+				do_restart
+				;;
+			test_connection)
+				test_connection
+				;;
+			*)
+				echo '{"error": "Unknown method"}'
+				;;
+		esac
+		;;
+	daemon)
+		run_daemon
+		;;
+	*)
+		echo '{"error": "Invalid action"}'
+		;;
+esac
