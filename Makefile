@@ -27,7 +27,9 @@ define Package/luci-app-hsgq-ddm
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=HSGQ GPON SFP stick Optical Diagnostics & DDM Monitor
-  DEPENDS:=+luci-base
+  # BusyBox on stock OpenWrt has no `timeout` applet; every telnet session is
+  # bounded with `timeout ... nc`, so without this the tool can never connect.
+  DEPENDS:=+luci-base +coreutils-timeout
   PKGARCH:=all
 endef
 

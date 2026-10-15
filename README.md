@@ -47,6 +47,7 @@ packages can be installed side by side.
 ## Requirements
 - OpenWrt **23.05 or newer** with **LuCI** (tested on 25.12)
 - BusyBox `nc` (included in standard OpenWrt builds)
+- **`coreutils-timeout`**: stock OpenWrt BusyBox has no `timeout` command, which the tool uses to bound every telnet session. **The installer adds it automatically**, and the package declares it as a dependency. To install it by hand: `apk add coreutils-timeout` (24+) / `opkg install coreutils-timeout` (23.05)
 - The router can reach the stick's **management IP** (see [below](#reaching-the-sticks-management-address))
 - The stick's **telnet username and password**
 
@@ -64,12 +65,13 @@ If `wget` reports an SSL error, install HTTPS support first:
 
 The installer:
 1. checks that it's running on OpenWrt with LuCI,
-2. downloads this repository,
-3. copies the files into place. An existing `/etc/config/hsgq_ddm` is **kept**, so reinstalling never wipes your settings,
-4. seeds missing defaults without overwriting existing values,
-5. registers the page with LuCI.
+2. installs `coreutils-timeout` if it's missing,
+3. downloads this repository,
+4. copies the files into place. An existing `/etc/config/hsgq_ddm` is **kept**, so reinstalling never wipes your settings,
+5. seeds missing defaults without overwriting existing values,
+6. registers the page with LuCI.
 
-It doesn't reboot anything and doesn't touch any other package.
+It doesn't reboot anything, and apart from adding `coreutils-timeout` when needed, it doesn't touch any other package.
 
 Preview without changing anything:
 ```sh
@@ -154,6 +156,7 @@ Run it as `KEEP_CONFIG=1 sh /tmp/uninstall.sh` to keep `/etc/config/hsgq_ddm`.
 |---|---|
 | Menu entry missing after install | Log out and back in to LuCI, then press Ctrl+F5 |
 | "Not configured" | Set address, username and password in Settings |
+| "Unable to connect" even though the stick answers ping | Check `command -v timeout` prints a path. If not: `apk add coreutils-timeout` |
 | "Unable to connect or authenticate" | `ping <stick IP>` from the router. Check the login works with `telnet <stick IP>`, and that the timeout is ≥ 15 s |
 | Works sometimes, then times out | The stick allows only a few telnet sessions. Close other telnet sessions and extra dashboard tabs |
 | Values look stale / old | The backend refuses to show data older than 45 s as live. Check the stick is reachable |

@@ -134,6 +134,9 @@ jobs:
         run: |
           set -eu
           grep -qE '^\s*PKGARCH\s*:=\s*all' Makefile
+          # Stock OpenWrt BusyBox has no `timeout`; the backend cannot connect without it.
+          grep -qE '^\s*DEPENDS\s*:=.*\+coreutils-timeout' Makefile || { echo "Makefile must depend on +coreutils-timeout"; exit 1; }
+          grep -q 'coreutils-timeout' install.sh || { echo "install.sh must ensure coreutils-timeout"; exit 1; }
           for f in root/lib/upgrade/keep.d/luci-app-hsgq-ddm root/usr/share/hsgq_ddm/parse.awk \
                    root/usr/share/hsgq_ddm/omci.awk root/etc/config/hsgq_ddm \
                    root/etc/uci-defaults/80_luci-app-hsgq-ddm LICENSE NOTICE; do

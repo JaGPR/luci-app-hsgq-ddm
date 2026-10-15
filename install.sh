@@ -27,6 +27,20 @@ command -v uci >/dev/null    || die "uci not found"
 command -v nc >/dev/null     || die "BusyBox nc is required (it talks telnet to the stick)"
 [ -d /www/luci-static ]      || die "LuCI is not installed (install luci first)"
 
+# Every telnet session is bounded with `timeout ... nc`. Stock OpenWrt BusyBox has
+# no timeout applet, so the coreutils one is required (same as luci-app-vsol-ddm).
+if ! command -v timeout >/dev/null 2>&1; then
+	say "Installing required dependency: coreutils-timeout"
+	if command -v apk >/dev/null 2>&1; then
+		run "apk update >/dev/null && apk add coreutils-timeout" || die "could not install coreutils-timeout (run: apk add coreutils-timeout)"
+	elif command -v opkg >/dev/null 2>&1; then
+		run "opkg update >/dev/null && opkg install coreutils-timeout" || die "could not install coreutils-timeout (run: opkg update && opkg install coreutils-timeout)"
+	else
+		die "no package manager found; install coreutils-timeout manually"
+	fi
+	[ "$DRY_RUN" = "1" ] || command -v timeout >/dev/null 2>&1 || die "timeout is still missing after installing coreutils-timeout"
+fi
+
 mkdir -p "$WORK"
 
 # 1. Fetch the source

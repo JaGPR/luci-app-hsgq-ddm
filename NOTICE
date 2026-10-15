@@ -46,4 +46,6 @@ Changes made in this fork (Apache-2.0 section 4(b)):
 
   Packaging
   - New install.sh / uninstall.sh for installing without the OpenWrt SDK.
+  - Declared dependency on coreutils-timeout (stock OpenWrt BusyBox has no
+    `timeout` applet); install.sh installs it when missing.
   - New uci-defaults and CI workflow adapted from the original.
