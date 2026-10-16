@@ -868,11 +868,13 @@ return view.extend({
 				var rect = canvas.getBoundingClientRect();
 				var mouseX = (ev.clientX - rect.left);
 				var nearest = null;
-				var minDist = 25;
+				var minDist = Infinity;
+				/* Snap to the reading nearest the cursor anywhere on the line. */
+				var pts = chartObj.hoverPoints || [];
 
-				if (chartObj.renderedDots && chartObj.renderedDots.length) {
-					for (var i = 0; i < chartObj.renderedDots.length; i++) {
-						var dot = chartObj.renderedDots[i];
+				if (pts.length) {
+					for (var i = 0; i < pts.length; i++) {
+						var dot = pts[i];
 						var dist = Math.abs(dot.x - mouseX);
 						if (dist < minDist) {
 							minDist = dist;
@@ -881,7 +883,8 @@ return view.extend({
 					}
 				}
 
-				if (chartObj.hoveredDot !== nearest) {
+				var prevT = chartObj.hoveredDot ? chartObj.hoveredDot.time : null;
+				if (prevT !== (nearest ? nearest.time : null)) {
 					chartObj.hoveredDot = nearest;
 					if (chartObj.lastArgs) {
 						renderChart(chartObj, chartObj.lastArgs.dataHistory, chartObj.lastArgs.thLo, chartObj.lastArgs.thHi, chartObj.lastArgs.warnLo, chartObj.lastArgs.warnHi);
@@ -1653,6 +1656,13 @@ return view.extend({
 			}
 
 			chartObj.renderedDots = renderedDots;
+			chartObj.hoverPoints = validPoints;
+			if (chartObj.hoveredDot) {
+				var hT = chartObj.hoveredDot.time, hNew = null;
+				for (var hp = 0; hp < validPoints.length; hp++)
+					if (validPoints[hp].time === hT) { hNew = validPoints[hp]; break; }
+				chartObj.hoveredDot = hNew;
+			}
 
 			// Draw standard dots
 			ctx.setLineDash([]);
