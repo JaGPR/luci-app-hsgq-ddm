@@ -749,6 +749,10 @@ return view.extend({
 
 		/* ---------------- Historical Time-Series Charts (1h/6h/12h/24h) ---- */
 		var MAX_CHART_SAMPLES = 1440;
+		/* One chart point per minute, the same cadence as the backend history, so the
+		 * 1440-point buffer really holds 24 h. Between points the newest one is updated
+		 * in place, which keeps the right-hand edge of the graph live. */
+		var LIVE_SAMPLE_MS = 55 * 1000;
 		var CHART_WINDOWS = [
 			{ key: '1h', label: '1h', hours: 1, ms: 1 * 3600 * 1000 },
 			{ key: '6h', label: '6h', hours: 6, ms: 6 * 3600 * 1000 },
@@ -778,6 +782,17 @@ return view.extend({
 				}
 			}
 		}
+
+		/* Open on the smallest window covering the stored history: a few hours of data
+		 * after a reboot should fill the chart, not a sliver of a 24 h axis. */
+		(function () {
+			var first = chartHistories.rx.length ? chartHistories.rx[0].time :
+				(chartHistories.temp.length ? chartHistories.temp[0].time : null);
+			if (first === null) { activeChartWindowMs = CHART_WINDOWS[0].ms; return; }
+			var span = Date.now() - first;
+			for (var w = 0; w < CHART_WINDOWS.length; w++)
+				if (span <= CHART_WINDOWS[w].ms) { activeChartWindowMs = CHART_WINDOWS[w].ms; return; }
+		})();
 
 		var renderAllCharts = function(statusData) {
 			var th = resolveThresholds(statusData);
@@ -1917,10 +1932,16 @@ return view.extend({
 			// 4. Update Time-Series Chart Data & Canvas Renderers
 			var tsNow = Date.now();
 			if (healthy) {
-				if (!isNaN(rx)) chartHistories.rx.push({ time: tsNow, val: rx });
-				if (!isNaN(tx)) chartHistories.tx.push({ time: tsNow, val: tx });
-				if (!isNaN(temp)) chartHistories.temp.push({ time: tsNow, val: temp });
-				if (!isNaN(bias)) chartHistories.bias.push({ time: tsNow, val: bias });
+				var addPoint = function (arr, v) {
+					if (isNaN(v)) return;
+					var last = arr.length ? arr[arr.length - 1] : null;
+					if (last && last.live && tsNow - last.start < LIVE_SAMPLE_MS) { last.time = tsNow; last.val = v; }
+					else arr.push({ time: tsNow, val: v, live: true, start: tsNow });
+				};
+				addPoint(chartHistories.rx, rx);
+				addPoint(chartHistories.tx, tx);
+				addPoint(chartHistories.temp, temp);
+				addPoint(chartHistories.bias, bias);
 
 				while (chartHistories.rx.length > MAX_CHART_SAMPLES) chartHistories.rx.shift();
 				while (chartHistories.tx.length > MAX_CHART_SAMPLES) chartHistories.tx.shift();

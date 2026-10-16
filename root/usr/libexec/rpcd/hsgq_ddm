@@ -178,10 +178,38 @@ get_history() {
 	printf ']}\n'
 }
 
+# History lives in RAM (/tmp) and would be lost on every reboot. The daemon saves it
+# to flash every PERSIST_EVERY minutes (~48 small writes a day) and on shutdown,
+# and restores the last 24 h when it starts.
+PERSIST_DIR="/etc/hsgq_ddm"
+PERSIST_FILE="$PERSIST_DIR/history.json"
+PERSIST_EVERY=30
+
+restore_history() {
+	[ -s "$HISTORY_FILE" ] && return 0
+	[ -s "$PERSIST_FILE" ] || return 0
+	_cut=$(( $(date +%s) - 86400 ))
+	awk -F'[][,]' -v cut="$_cut" '$2 >= cut' "$PERSIST_FILE" > "$HISTORY_FILE" 2>/dev/null || rm -f "$HISTORY_FILE"
+}
+
+persist_history() {
+	[ -s "$HISTORY_FILE" ] || return 0
+	mkdir -p "$PERSIST_DIR" 2>/dev/null
+	cp "$HISTORY_FILE" "$PERSIST_FILE.tmp" 2>/dev/null && mv "$PERSIST_FILE.tmp" "$PERSIST_FILE"
+}
+
 run_daemon() {
+	restore_history
+	# procd stops the daemon with TERM; save first. sleep runs in the background so
+	# the trap fires immediately instead of after up to 60 s.
+	trap 'persist_history; exit 0' TERM INT
+	_n=0
 	while true; do
 		fetch_telemetry >/dev/null 2>&1
-		sleep 60
+		_n=$((_n + 1))
+		[ $((_n % PERSIST_EVERY)) -eq 0 ] && persist_history
+		sleep 60 &
+		wait $!
 	done
 }
 
