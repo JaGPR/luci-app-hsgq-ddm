@@ -1394,6 +1394,8 @@ return view.extend({
 				sum += v;
 			}
 			var avgValNum = sum / validSamples.length;
+			/* Stats describe the readings; the axis below also widens to the alarm limits. */
+			var dataMin = minVal, dataMax = maxVal;
 
 			if (chartObj.minFixed != null) minVal = Math.min(minVal, chartObj.minFixed);
 			if (chartObj.maxFixed != null) maxVal = Math.max(maxVal, chartObj.maxFixed);
@@ -1432,8 +1434,8 @@ return view.extend({
 					curEl.style.color = headerColor;
 				}
 			}
-			if (minEl) minEl.textContent = 'Min: ' + minVal.toFixed(1);
-			if (maxEl) maxEl.textContent = 'Max: ' + maxVal.toFixed(1);
+			if (minEl) minEl.textContent = 'Min: ' + dataMin.toFixed(1);
+			if (maxEl) maxEl.textContent = 'Max: ' + dataMax.toFixed(1);
 			if (avgEl) avgEl.textContent = 'Avg: ' + avgValNum.toFixed(1);
 
 			// Draw full Grafana Green, Yellow, and Red threshold background area bands
@@ -1627,8 +1629,8 @@ return view.extend({
 				ctx.stroke();
 			}
 
-			// 3. Draw consistent sample dots (spaced 30 mins apart along the recorded line)
-			var DOT_INTERVAL_MS = 30 * 60 * 1000;
+			// 3. Draw sample dots (about 60 per window: every minute on 1h, every 24 min on 24h)
+			var DOT_INTERVAL_MS = Math.max(60 * 1000, (activeChartWindowMs || 24 * 3600 * 1000) / 60);
 			var renderedDots = [];
 			var lastDotTime = -Infinity;
 
@@ -1638,7 +1640,7 @@ return view.extend({
 				var isLast = (d === validPoints.length - 1);
 				var isInterval = (pt.time - lastDotTime >= DOT_INTERVAL_MS - 60000);
 
-				if (isFirst || isInterval || (isLast && (pt.time - lastDotTime >= 10 * 60 * 1000))) {
+				if (isFirst || isInterval || (isLast && (pt.time - lastDotTime >= DOT_INTERVAL_MS / 3))) {
 					renderedDots.push({
 						x: pt.x,
 						y: pt.y,
